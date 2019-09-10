@@ -2358,6 +2358,30 @@ void MidiOutAlsa :: sendMessage( const unsigned char *message, size_t size )
 #include <windows.h>
 #include <mmsystem.h>
 
+#ifdef BMIDI
+// BMIDI is a virtual MIDI port driver and SDK published for licensing by Bome Software:
+// https://www.bome.com/products/bmidi
+//
+// If you have acquired a BMIDI license, just set the symbol "BMIDI" in your project settings.
+//
+// Then make sure that the header file bmidilib2.h can be found with the statement below:
+// 1) copy the file bmidilib2.h to the same source folder, or
+// 2) set the search path for include files to point to where you have placed bmidilib2.h (can use relative paths), or
+// 3) adapt the include statement below to include the path
+//
+// Including bmidilib2.h will automatically link to the required libs like bmidilib2.lib.
+//
+// The ClientName provided to the RtMidiIn and RtMidiOut constructors is used
+// as BMIDI AppID. You should use the same client name for input and output.
+//
+// Note that adding a virtual Input port will add a port to the returned list
+// of Windows Output ports with the provided name, and vice versa for virtual output ports.
+//
+// Refer to the BMIDI SDK documentation for details.
+//
+#include "bmidilib2.h"
+#endif
+
 // Convert a null-terminated wide string or ANSI-encoded string to UTF-8.
 static std::string ConvertToUTF8(const TCHAR *str)
 {
@@ -2398,6 +2422,9 @@ struct WinMidiData {
   MidiInApi::MidiMessage message;
   LPMIDIHDR sysexBuffer[RT_SYSEX_BUFFER_COUNT];
   CRITICAL_SECTION _mutex; // [Patrice] see https://groups.google.com/forum/#!topic/mididev/6OUjHutMpEo
+#ifdef BMIDI
+  BMIDI_HANDLE bmidiHandle;
+#endif
 };
 
 //*********************************************************************//
@@ -2500,6 +2527,98 @@ static void CALLBACK midiInputCallback( HMIDIIN /*hmin*/,
   apiData->message.bytes.clear();
 }
 
+
+#ifdef BMIDI
+// BMIDI callback for BMIDI_OUT ports
+void BMIDI_CALLBACK_DECL bmidiInputCallback(BMIDI_HANDLE handle,
+  BByte* msg, BInt32 len, void* userData)
+{
+  if (msg == NULL || len < 1 || userData == NULL) {
+    return;
+  }
+
+  MidiInApi::RtMidiInData *data = (MidiInApi::RtMidiInData *)userData;
+  WinMidiData *apiData = static_cast<WinMidiData *> (data->apiData);
+
+  //fake timestamp
+  DWORD timestamp = timeGetTime();
+
+  // Calculate time stamp.
+  if (data->firstMessage == true) {
+    apiData->message.timeStamp = 0.0;
+    data->firstMessage = false;
+  } else {
+    apiData->message.timeStamp = (double)(timestamp - apiData->lastTime) * 0.001;
+  }
+
+  // Make sure the first byte is a status byte.
+  BByte status = msg[0];
+  if (!(status & 0x80)) return;
+
+  // Determine the number of bytes in the MIDI message.
+  if (status == 0xF0 && (data->ignoreFlags & 0x01)) {
+    // ignore Sys Ex
+    return;
+  }
+  if (status == 0xF1 && (data->ignoreFlags & 0x02)) {
+    return;
+  }
+  if (status == 0xF8 && (data->ignoreFlags & 0x02)) {
+    // A MIDI timing tick message and we're ignoring it.
+    return;
+  }
+  if (status == 0xFE && (data->ignoreFlags & 0x04)) {
+    // A MIDI active sensing message and we're ignoring it.
+    return;
+  }
+
+  // Copy bytes to our MIDI message.
+  unsigned char *ptr = (unsigned char *)msg;
+  for (int i = 0; i < len; ++i) {
+    apiData->message.bytes.push_back(*ptr++);
+  }
+
+  // Save the time of the last non-filtered message
+  apiData->lastTime = timestamp;
+
+  if (data->usingCallback) {
+    RtMidiIn::RtMidiCallback callback = (RtMidiIn::RtMidiCallback) data->userCallback;
+    callback(apiData->message.timeStamp, &apiData->message.bytes, data->userData);
+  }
+  else {
+    // As long as we haven't reached our queue size limit, push the message.
+    if (!data->queue.push(apiData->message))
+      std::cerr << "\nMidiInWinMM: message queue limit reached!!\n\n";
+  }
+
+  // Clear the vector for the next input message.
+  apiData->message.bytes.clear();
+}
+
+BInt32 BMIDI_GetPortIndexByNameAndDirection(IN const BChar* appID, IN const BChar* portName, IN BMIDI_PORT_DIR dir) {
+  if (dir == BMIDI_INOUT) {
+    return BMIDI_GetPortIndexByName(appID, portName);
+  }
+  BInt32 ret = 0;
+  BMIDI_PORT_INFO info;
+  BInt32 count = BMIDI_GetPortCount(appID);
+  for (BInt32 i = 0; i < count; i++) {
+    if (BMIDI_GetPortInfo(appID, i, &info) == BMIDI_SUCCESS) {
+      if (dir == BMIDI_IN) {
+        if (strcmp(info.inputPortName, portName) == 0) {
+          return i;
+        }
+      } else if (strcmp(info.outputPortName, portName) == 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+#endif //BMIDI
+
+
 MidiInWinMM :: MidiInWinMM( const std::string &clientName, unsigned int queueSizeLimit )
   : MidiInApi( queueSizeLimit )
 {
@@ -2538,6 +2657,10 @@ void MidiInWinMM :: initialize( const std::string& /*clientName*/ )
     errorString_ = "MidiInWinMM::initialize: InitializeCriticalSectionAndSpinCount failed.";
     error( RtMidiError::WARNING, errorString_ );
   }
+
+#ifdef BMIDI
+  data->bmidiHandle = NULL;
+#endif
 }
 
 void MidiInWinMM :: openPort( unsigned int portNumber, const std::string &/*portName*/ )
@@ -2615,17 +2738,88 @@ void MidiInWinMM :: openPort( unsigned int portNumber, const std::string &/*port
   connected_ = true;
 }
 
-void MidiInWinMM :: openVirtualPort( const std::string &/*portName*/ )
+void rtmidi_string_replace(std::string& str, const std::string& from, const std::string& to) {
+  size_t start_pos;
+  while ( (start_pos = str.find(from)) != std::string::npos) {
+    str.replace(start_pos, from.length(), to);
+  }
+}
+
+void MidiInWinMM :: openVirtualPort( const std::string &portName )
 {
+#ifndef BMIDI
   // This function cannot be implemented for the Windows MM MIDI API.
   errorString_ = "MidiInWinMM::openVirtualPort: cannot be implemented in Windows MM MIDI API!";
   error( RtMidiError::WARNING, errorString_ );
+  // satisfy compiler
+  (void)portName;
+#else
+  // BMIDI
+  WinMidiData *data = static_cast<WinMidiData *> (apiData_);
+
+  if (!BMIDI_isLibAvailable()) {
+    errorString_ = "MidiInWinMM::openVirtualPort: BMIDI library is not installed.";
+    error(RtMidiError::DRIVER_ERROR, errorString_);
+    return;
+  }
+  if (portName.length() == 0) {
+    errorString_ = "MidiInWinMM::openVirtualPort: trying to create a port with empty name.";
+    error(RtMidiError::DRIVER_ERROR, errorString_);
+    return;
+  }
+  if (data->bmidiHandle != NULL) {
+    error(RtMidiError::WARNING, std::string("MidiInWinMM::openVirtualPort: virtual port already open: ") + portName);
+    return;
+  }
+  // clean up AppID
+  std::string appID = portName;
+  // do not include "input"
+  rtmidi_string_replace(appID, "input", "");
+  rtmidi_string_replace(appID, "Input", "");
+  rtmidi_string_replace(appID, "INPUT", "");
+  // note: no need to clean up spaces. BMIDI ignores any spaces in AppID.
+
+  // Query for existence of such a port.
+  // Note: cannot use BMIDI_GetPortIndexByName() here, because it might erronously return a BMIDI_IN-only port here.
+  // Note: BMIDI keeps the view from 3rd party applications. So for receiving data here, we need to create a BMIDI_OUT port.
+  BInt32 bmidiPortIndex = BMIDI_GetPortIndexByNameAndDirection(appID.c_str(), portName.c_str(), BMIDI_OUT);
+  BMIDI_RESULT result;
+
+  if (bmidiPortIndex < 0) {
+    // port does not exist, so create it
+    result = BMIDI_AddPort(appID.c_str(), NULL/*BMIDI_IN*/, portName.c_str()/*BMIDI_OUT*/, &bmidiPortIndex);
+    if (result != BMIDI_SUCCESS) {
+      errorString_ = std::string("MidiInWinMM::openVirtualPort(") + portName + std::string("): error creating BMIDI_OUT port:") + std::string(BMIDI_GetErrorString(result));
+      error(RtMidiError::DRIVER_ERROR, errorString_);
+      return;
+    }
+    // give some time to install the port. The first install will take much longer, though.
+    // It's best to install the port prior to this call using BMIDI_AddPort() or via the
+    // portinstall utility included with the BMIDI API.
+    Sleep(1000);
+  }
+
+  result = BMIDI_Connect(appID.c_str(), bmidiPortIndex, BMIDI_OUT, &bmidiInputCallback, &inputData_, &(data->bmidiHandle));
+  if (result != BMIDI_SUCCESS) {
+    errorString_ = std::string("MidiInWinMM::openVirtualPort(") + portName + std::string("): error opening BMIDI_OUT port:") + std::string(BMIDI_GetErrorString(result));
+    error(RtMidiError::DRIVER_ERROR, errorString_);
+    return;
+  }
+#endif //BMIDI
 }
 
 void MidiInWinMM :: closePort( void )
 {
+  WinMidiData *data = static_cast<WinMidiData *> (apiData_);
+#ifdef BMIDI
+  if (data->bmidiHandle != NULL) {
+    // virtual input port here is BMIDI_OUT (as seen from other applications)
+    BMIDI_Disconnect(data->bmidiHandle, BMIDI_OUT);
+    data->bmidiHandle = NULL;
+    // note: do not remove the port here.
+  }
+#endif
   if ( connected_ ) {
-    WinMidiData *data = static_cast<WinMidiData *> (apiData_);
     EnterCriticalSection( &(data->_mutex) );
     midiInReset( data->inHandle );
     midiInStop( data->inHandle );
@@ -2733,6 +2927,11 @@ void MidiOutWinMM :: initialize( const std::string& /*clientName*/ )
   // Save our api-specific connection information.
   WinMidiData *data = (WinMidiData *) new WinMidiData;
   apiData_ = (void *) data;
+
+#ifdef BMIDI
+  data->bmidiHandle = NULL;
+#endif
+
 }
 
 unsigned int MidiOutWinMM :: getPortCount()
@@ -2809,8 +3008,17 @@ void MidiOutWinMM :: openPort( unsigned int portNumber, const std::string &/*por
 
 void MidiOutWinMM :: closePort( void )
 {
+  WinMidiData *data = static_cast<WinMidiData *> (apiData_);
+#ifdef BMIDI
+  if (data->bmidiHandle != NULL) {
+    // virtual output port here is BMIDI_IN (as seen from other applications)
+    BMIDI_Disconnect(data->bmidiHandle, BMIDI_IN);
+    data->bmidiHandle = NULL;
+    // note: do not remove the port here.
+  }
+#endif //BMIDI
+
   if ( connected_ ) {
-    WinMidiData *data = static_cast<WinMidiData *> (apiData_);
     midiOutReset( data->outHandle );
     midiOutClose( data->outHandle );
     data->outHandle = 0;
@@ -2834,15 +3042,85 @@ void MidiOutWinMM :: setPortName ( const std::string& )
 
 }
 
-void MidiOutWinMM :: openVirtualPort( const std::string &/*portName*/ )
+void MidiOutWinMM :: openVirtualPort( const std::string &portName )
 {
+#ifndef BMIDI
   // This function cannot be implemented for the Windows MM MIDI API.
   errorString_ = "MidiOutWinMM::openVirtualPort: cannot be implemented in Windows MM MIDI API!";
   error( RtMidiError::WARNING, errorString_ );
+  // satisfy compiler
+  (void)portName;
+#else
+  // BMIDI
+  WinMidiData *data = static_cast<WinMidiData *> (apiData_);
+
+  if (!BMIDI_isLibAvailable()) {
+    errorString_ = "MidiOutWinMM::openVirtualPort: BMIDI library is not installed.";
+    error(RtMidiError::DRIVER_ERROR, errorString_);
+    return;
+  }
+  if (portName.length() == 0) {
+    errorString_ = "MidiOutWinMM::openVirtualPort: trying to create a port with empty name.";
+    error(RtMidiError::DRIVER_ERROR, errorString_);
+    return;
+  }
+  if (data->bmidiHandle != NULL) {
+    error(RtMidiError::WARNING, std::string("MidiOutWinMM::openVirtualPort: virtual port already open: ") + portName);
+    return;
+  }
+  // clean up AppID
+  std::string appID = portName;
+  // do not include "output"
+  rtmidi_string_replace(appID, "output", "");
+  rtmidi_string_replace(appID, "Output", "");
+  rtmidi_string_replace(appID, "OUTPUT", "");
+  // note: no need to clean up spaces. BMIDI ignores any spaces in AppID.
+
+  // Query for existence of such a port.
+  // Note: cannot use BMIDI_GetPortIndexByName() here, because it might erronously return a BMIDI_OUT-only port here.
+  // Note: BMIDI keeps the view from 3rd party applications. So for sending data here, we need to create a BMIDI_IN port.
+  BInt32 bmidiPortIndex = BMIDI_GetPortIndexByNameAndDirection(appID.c_str(), portName.c_str(), BMIDI_IN);
+  BMIDI_RESULT result;
+
+  if (bmidiPortIndex < 0) {
+    // port does not exist, so create it
+    result = BMIDI_AddPort(appID.c_str(), portName.c_str()/*BMIDI_IN*/, NULL/*BMIDI_OUT*/, &bmidiPortIndex);
+    if (result != BMIDI_SUCCESS) {
+      errorString_ = std::string("MidiOutWinMM::openVirtualPort(") + portName + std::string("): error creating BMIDI_IN port:") + std::string(BMIDI_GetErrorString(result));
+      error(RtMidiError::DRIVER_ERROR, errorString_);
+      return;
+    }
+    // give some time to install the port. The first install will take much longer, though.
+    // It's best to install the port prior to this call using BMIDI_AddPort() or via the
+    // portinstall utility included with the BMIDI API.
+    Sleep(1000);
+  }
+
+  result = BMIDI_Connect(appID.c_str(), bmidiPortIndex, BMIDI_IN, NULL/*callback*/, NULL/*callbackUserData*/, &(data->bmidiHandle));
+  if (result != BMIDI_SUCCESS) {
+    errorString_ = std::string("MidiOutWinMM::openVirtualPort(") + portName + std::string("): error opening BMIDI_IN port:") + std::string(BMIDI_GetErrorString(result));
+    error(RtMidiError::DRIVER_ERROR, errorString_);
+    return;
+  }
+#endif //BMIDI
 }
 
 void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
 {
+  WinMidiData *data = static_cast<WinMidiData *> (apiData_);
+
+#ifdef BMIDI
+  // send to virtual port in addition to possibly otherwise opened port
+  // Even if not connected.
+  if (data->bmidiHandle != NULL) {
+    BMIDI_RESULT result = BMIDI_Send(data->bmidiHandle, (BByte*)message, (BInt32)size);
+    if (result != BMIDI_SUCCESS) {
+      errorString_ = std::string("MidiOutWinMM::sendMessage: ") + std::string(BMIDI_GetErrorString(result));
+      error(RtMidiError::DRIVER_ERROR, errorString_);
+    }
+  }
+#endif //BMIDI
+
   if ( !connected_ ) return;
 
   unsigned int nBytes = static_cast<unsigned int>(size);
@@ -2853,7 +3131,6 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
   }
 
   MMRESULT result;
-  WinMidiData *data = static_cast<WinMidiData *> (apiData_);
   if ( message[0] == 0xF0 ) { // Sysex message
 
     // Allocate buffer for sysex data.
